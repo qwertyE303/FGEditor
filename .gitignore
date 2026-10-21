@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+*.spec
+build/
+dist/
+release/
+FGEditor.ini
+FGEditor.log
+.venv/
+build.ps1
+tests/
