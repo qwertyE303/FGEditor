@@ -13,6 +13,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Sequence
 
+from .encoding import decode_ansi, encode_ansi
+
 NEMO_MAGIC = b"Nemo Fi\x00"
 HEADER_SIZE = 64
 HEADER_FORMAT = "<8s14I"
@@ -47,8 +49,8 @@ def u32(data: bytes, offset: int) -> int:
 
 
 def pad_name(name: str) -> bytes:
-    """Virtools object-table names are padded to a 4-byte boundary with NUL."""
-    raw = name.encode("utf-8")
+    """Virtools object-table names are ANSI/GBK, padded to 4 bytes with NUL."""
+    raw = encode_ansi(name, strict=True)
     size = (len(raw) + 3) // 4 * 4
     return raw + b"\x00" * (size - len(raw))
 
@@ -120,6 +122,7 @@ class StateChunk:
     options: int
     data: bytes
     identifiers: list[Identifier] = field(default_factory=list)
+    trailing: bytes = b""
 
     @classmethod
     def parse(cls, chunk: bytes) -> "StateChunk":
@@ -132,7 +135,8 @@ class StateChunk:
             raise ValueError(
                 f"state chunk data size {data_dw_size} exceeds chunk size {len(chunk)}")
         data = chunk[8:data_end]
-        state = cls(data_version, class_id, chunk_version, options, data)
+        state = cls(data_version, class_id, chunk_version, options, data,
+                    trailing=chunk[data_end:])
         state._parse_identifiers()
         return state
 
@@ -275,7 +279,7 @@ class NmoFile:
                 raise ValueError("object name is truncated")
             name_bytes = header_raw[pos:pos + namelen]
             pos += namelen
-            name = name_bytes.split(b"\x00", 1)[0].decode("utf-8", errors="replace")
+            name = decode_ansi(name_bytes.split(b"\x00", 1)[0])
             objects.append(NmoObject(
                 index=index,
                 object_id=object_id,

@@ -1,8 +1,8 @@
-"""Expression and domain validation for FG_Custom.
+"""Expression and domain validation for FGEditor.
 
-This module is the editor-side implementation of the grammar documented in
-``FG_Custom_Spec.md``.  It validates syntax only; it never evaluates a
-function.  The mod-side evaluator must implement the same grammar.
+Function expressions keep the v1 grammar.  Domain expressions use the v2.1
+boolean grammar: ``and``/``&&``, ``or``/``||``, ``not``/``!``, parentheses and
+chained comparisons.  Only syntax is checked; nothing is evaluated.
 """
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ from dataclasses import dataclass
 
 COORDINATE_NOTE = (
     "Ballance里y轴为高度，且为左手系，因此定义："
-    "Theta是位置矢量在z平面投影和x的夹角（范围0~2pi），"
+    "Theta是位置矢量在xz平面投影和x的夹角（范围0~2pi），"
     "Phi是和位置矢量和xz平面的夹角（范围-0.5pi~0.5pi）"
 )
 
@@ -94,7 +94,6 @@ class Token:
 _NUMBER_RE = re.compile(r"(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?")
 _IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _OP_CHARS = set("+-*/^")
-_REL_CHARS = set("=<>!")
 
 
 def tokenize(text: str) -> list[Token]:
@@ -117,7 +116,12 @@ def tokenize(text: str) -> list[Token]:
             match = _IDENT_RE.match(text, index)
             if not match:
                 raise ExprError("无效的标识符", index, text)
-            tokens.append(Token("IDENT", match.group(0), index))
+            word = match.group(0)
+            lower = word.lower()
+            if lower in ("and", "or", "not"):
+                tokens.append(Token(lower.upper(), word, index))
+            else:
+                tokens.append(Token("IDENT", word, index))
             index = match.end()
             continue
         if char in _OP_CHARS:
@@ -136,17 +140,41 @@ def tokenize(text: str) -> list[Token]:
             tokens.append(Token("COMMA", char, index))
             index += 1
             continue
-        if char in _REL_CHARS:
+        if char == ";":
+            raise ExprError("不支持分号", index, text)
+        if char == "&":
+            if text[index:index + 2] == "&&":
+                tokens.append(Token("AND", "&&", index))
+                index += 2
+                continue
+            raise ExprError("单独的 & 不合法；请写 &&", index, text)
+        if char == "|":
+            if text[index:index + 2] == "||":
+                tokens.append(Token("OR", "||", index))
+                index += 2
+                continue
+            raise ExprError("单独的 | 不合法；请写 ||", index, text)
+        if char == "!":
+            if text[index:index + 2] == "!=":
+                tokens.append(Token("REL", "!=", index))
+                index += 2
+                continue
+            tokens.append(Token("NOT", "!", index))
+            index += 1
+            continue
+        if char in "=<>":
             pair = text[index:index + 2]
-            if pair in ("!=", "<=", ">="):
+            if pair == "==":
+                raise ExprError("不支持 ==；相等请写 =", index, text)
+            if pair == "<>":
+                raise ExprError("不支持 <>；不等请写 !=", index, text)
+            if pair in ("<=", ">="):
                 tokens.append(Token("REL", pair, index))
                 index += 2
                 continue
-            if char in "=<>":
-                tokens.append(Token("REL", char, index))
-                index += 1
-                continue
-            raise ExprError("不支持字符 !；不等号请写 !=", index, text)
+            tokens.append(Token("REL", char, index))
+            index += 1
+            continue
         raise ExprError("只支持英文半角字符", index, text)
     tokens.append(Token("EOF", "", length))
     return tokens
@@ -167,12 +195,11 @@ def _needs_implicit_multiplication(left: Token, right: Token) -> bool:
     if left.kind in ("NUMBER", "RPAREN") and right.kind in ("NUMBER", "IDENT", "LPAREN"):
         return True
     if left.kind == "IDENT" and right.kind == "LPAREN":
-        # Known functions are calls; variables/constants are implicit products.
         return left.value.lower() not in FUNCTION_SPECS
     return False
 
 
-class _Parser:
+class _ArithmeticMixin:
     def __init__(self, tokens: list[Token], text: str, allowed_vars: frozenset[str]):
         self.tokens = tokens
         self.text = text
@@ -274,7 +301,13 @@ class _Parser:
             raise self.error("这里需要表达式，不能直接出现逗号", token)
         if token.kind == "RPAREN":
             raise self.error("这里需要表达式", token)
+        if token.kind in ("AND", "OR", "NOT"):
+            raise self.error("这里需要表达式，不能直接出现逻辑运算符", token)
         raise self.error("这里需要数字、变量、常量、函数或 (", token)
+
+
+class _Parser(_ArithmeticMixin):
+    pass
 
 
 def _check_expression_tail(parser: _Parser) -> None:
@@ -285,6 +318,8 @@ def _check_expression_tail(parser: _Parser) -> None:
         raise parser.error("函数表达式不能包含关系符（=、!=、<、<=、>、>=）", token)
     if token.kind == "COMMA":
         raise parser.error("函数表达式不能包含逗号（函数参数除外）", token)
+    if token.kind in ("AND", "OR", "NOT"):
+        raise parser.error("函数表达式不能包含逻辑运算符（and/or/not）", token)
     if token.kind == "RPAREN":
         raise parser.error("多余的右括号", token)
     if token.kind in ("IDENT", "NUMBER", "LPAREN"):
@@ -306,37 +341,73 @@ def check_function(text: str, allowed_vars: frozenset[str] | set[str]) -> str | 
     return None
 
 
-def check_domain(text: str) -> str | None:
-    """Return a human-readable syntax error, or None if valid.
+class _DomainParser(_ArithmeticMixin):
+    def parse_domain(self) -> None:
+        self.parse_or()
+        token = self.peek()
+        if token.kind != "EOF":
+            if token.kind == "COMMA":
+                raise self.error("顶层逗号不再表示 AND；请使用 and", token)
+            if token.kind == "RPAREN":
+                raise self.error("多余的右括号", token)
+            raise self.error("作用域表达式后有多余内容", token)
 
-    An empty Domain is valid (global effect).
+    def parse_or(self) -> None:
+        self.parse_and()
+        while self.peek().kind == "OR":
+            self.advance()
+            self.parse_and()
+
+    def parse_and(self) -> None:
+        self.parse_not()
+        while self.peek().kind == "AND":
+            self.advance()
+            self.parse_not()
+
+    def parse_not(self) -> None:
+        if self.peek().kind == "NOT":
+            self.advance()
+            self.parse_not()
+            return
+        self.parse_atom()
+
+    def parse_atom(self) -> None:
+        if self.peek().kind == "LPAREN":
+            saved = self.index
+            try:
+                self.parse_comparison()
+                return
+            except ExprError:
+                self.index = saved
+            self.advance()
+            self.parse_or()
+            self.expect("RPAREN", "右括号 )")
+            return
+        self.parse_comparison()
+
+    def parse_comparison(self) -> None:
+        self.parse_expression()
+        if self.peek().kind != "REL":
+            raise self.error("缺少关系符（=、!=、<、<=、>、>=）")
+        self.advance()
+        self.parse_expression()
+        while self.peek().kind == "REL":
+            self.advance()
+            self.parse_expression()
+
+
+def check_domain(text: str, allow_empty: bool = False) -> str | None:
+    """Return a syntax error, or None if valid.
+
+    CRegion domains cannot be empty.  ``allow_empty`` is available for callers
+    that need to inspect an imported empty domain without flagging it.
     """
     if not text.strip():
-        return None
+        return None if allow_empty else "定义域不能为空"
     try:
         tokens = _insert_implicit_multiplication(tokenize(text))
-        parser = _Parser(tokens, text, DOMAIN_VARS)
-        if parser.peek().kind == "EOF":
-            return "作用区域不能为空"
-        while True:
-            parser.parse_expression()
-            if parser.peek().kind != "REL":
-                raise parser.error("缺少关系符（=、!=、<、<=、>、>=）")
-            parser.advance()
-            parser.parse_expression()
-            if parser.peek().kind == "REL":
-                raise parser.error("一个关系式只能有一个关系符")
-            token = parser.peek()
-            if token.kind == "COMMA":
-                parser.advance()
-                if parser.peek().kind == "EOF":
-                    raise parser.error("英文逗号后不能为空")
-                continue
-            if token.kind == "EOF":
-                break
-            if token.kind in ("IDENT", "NUMBER", "LPAREN"):
-                raise parser.error("关系式之间只能用英文逗号分隔")
-            raise parser.error("作用区域只能包含关系式，并用英文逗号分隔")
+        parser = _DomainParser(tokens, text, DOMAIN_VARS)
+        parser.parse_domain()
     except ExprError as exc:
         return str(exc)
     return None
@@ -402,4 +473,34 @@ code {{ font-family: Consolas, monospace; }}
 <tr><th>函数</th><th>说明</th><th>示例</th></tr>
 {"".join(function_rows)}
 </table>
+</body></html>"""
+
+
+def domain_help_html() -> str:
+    """HTML for the '作用域填写说明' dialog."""
+    return f"""<!doctype html>
+<html><head><meta charset="utf-8"><style>
+body {{ font-family: "Microsoft YaHei UI"; font-size: 10pt; }}
+h3 {{ margin: 14px 0 6px 0; }}
+table {{ border-collapse: collapse; margin: 4px 0 10px 0; }}
+th, td {{ border: 1px solid #999; padding: 3px 7px; vertical-align: top; }}
+th {{ font-weight: bold; }}
+code {{ font-family: Consolas, monospace; }}
+.note {{ color: #444; }}
+</style></head><body>
+<p><b>{html.escape(COORDINATE_NOTE)}</b></p>
+
+<p>运算符、常量与变量、函数同场函数填写说明。</p>
+
+<h3>逻辑运算符</h3>
+<table width="100%">
+<tr><th>运算符</th><th>含义</th><th>示例</th></tr>
+<tr><td><code>and</code> / <code>&amp;&amp;</code></td><td>与</td><td><code>x&gt;0 and y&gt;0</code></td></tr>
+<tr><td><code>or</code> / <code>||</code></td><td>或</td><td><code>x=1 or y=1</code></td></tr>
+<tr><td><code>not</code> / <code>!</code></td><td>非</td><td><code>not (x=1)</code>、<code>!(x=1)</code></td></tr>
+<tr><td><code>( )</code></td><td>改变优先级</td><td><code>(x=1 or y=1) and z&gt;0</code></td></tr>
+</table>
+
+<h3>优先级</h3>
+<p>括号 &gt; 比较 &gt; <code>not</code> &gt; <code>and</code> &gt; <code>or</code>。</p>
 </body></html>"""
